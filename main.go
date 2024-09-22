@@ -21,11 +21,14 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
+	"google.golang.org/api/sheets/v4"
 )
 
 const (
 	hostAndPort     = "localhost:8080"
 	basketballEmail = "basketball@adelaideunisport.com.au"
+	sheetID         = "12KmIFrkqd2G9Mavxcez8VA6kcZ9O-oKGJzcewQRgLrU"
+	productFilter   = "Fitness Hub"
 	defaultPort     = 8080
 )
 
@@ -148,26 +151,72 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	list, err := service.Users.Messages.List(basketballEmail).LabelIds("Label_7006746477333341141").Do()
+	list, err := service.Users.Messages.List(basketballEmail).LabelIds("Label_7006746477333341141").Q(productFilter).Do()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "unable to get emails with given label: %v", err)
+		log.Printf("unable to get emails with given label: %v", err)
+		redirectToSheet(w, r)
 		return
 	}
 
 	if len(list.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "unable to find any matching emails")
+		log.Printf("unable to find any matching emails")
+		redirectToSheet(w, r)
 		return
 	}
 	length := len(list.Messages)
-	log.Printf("got %d emails", length)
+
+	ctx := context.Background()
+	creds, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/drive.file")
+	if err != nil {
+		log.Println("could not find default credentials:", err)
+		redirectToSheet(w, r)
+		return
+	}
+
+	sheetsService, err := sheets.NewService(ctx, option.WithCredentials(creds))
+	if err != nil {
+		log.Println("failed to get sheets service:", err)
+		redirectToSheet(w, r)
+		return
+	}
+
+	values, err := sheetsService.Spreadsheets.Values.Get("12KmIFrkqd2G9Mavxcez8VA6kcZ9O-oKGJzcewQRgLrU", "ID!A:A").Do()
+	if err != nil {
+		log.Println("failed to get spreadsheet values:", err)
+		redirectToSheet(w, r)
+		return
+	}
+	readIDs := make(map[string]bool)
+	if len(values.Values) >= 0 {
+		for _, v := range values.Values {
+			readIDs[v[0].(string)] = true
+		}
+	}
+
+	newEmailsLen := length - len(values.Values)
+	log.Printf("got %d emails, parsing %d new emails", length, newEmailsLen)
+
+	if newEmailsLen == 0 {
+		redirectToSheet(w, r)
+		return
+	}
 
 	var wg sync.WaitGroup
 	ch := make(chan Order, length)
-	wg.Add(length)
+	ids := &sheets.ValueRange{
+		Values: [][]interface{}{},
+	}
 	for _, message := range list.Messages {
 		time.Sleep(10 * time.Millisecond)
+		if readIDs[message.Id] {
+			continue
+		} else {
+			ids.Values = append(ids.Values, []interface{}{message.Id})
+		}
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
+
 			// Retrieve the full message to access its payload and headers
 			fullMessage, err := service.Users.Messages.Get(basketballEmail, message.Id).Do()
 			if err != nil {
@@ -191,7 +240,6 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 			for _, order := range *orders {
 				ch <- order
 			}
-			wg.Done()
 		}()
 	}
 	go func() {
@@ -205,27 +253,39 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
+	_, err = sheetsService.Spreadsheets.Values.Append(sheetID, "ID!A:A", ids).ValueInputOption("RAW").Do()
+	if err != nil {
+		log.Println("failed to append spreadsheet values:", err)
+		redirectToSheet(w, r)
+		return
+	}
+
 	sort.Slice(orders, func(i, j int) bool {
 		return orders[i].Time < orders[j].Time
 	})
 
-	var heading string
-	fmt.Fprintf(w, "Fitness Hub Training Session Bookings\n\tIf the date you want isn't visible, it means that no-one has booked into this session yet")
-	for _, order := range orders {
-		if order.Time != heading {
-			heading = order.Time
-			fmt.Fprintln(w, heading)
-		}
-		fmt.Fprintf(w, "\t%s\n", order.Name)
+	ordersToWrite := &sheets.ValueRange{
+		Values: [][]interface{}{},
 	}
-	w.WriteHeader(200)
-	log.Println("Parsed all messages")
+	for _, order := range orders {
+		ordersToWrite.Values = append(ordersToWrite.Values, []interface{}{order.Time, order.Name})
+	}
+
+	_, err = sheetsService.Spreadsheets.Values.Append(sheetID, "Sessions!A:B", ordersToWrite).
+		ValueInputOption("RAW").
+		Do()
+	if err != nil {
+		log.Println("failed to append spreadsheet values:", err)
+		redirectToSheet(w, r)
+		return
+	}
+
+	redirectToSheet(w, r)
+
 }
 
-func writeError(w http.ResponseWriter, statusCode int, msg string, args ...any) {
-	log.Printf(msg, args...)
-	w.WriteHeader(statusCode)
-	w.Write([]byte(fmt.Sprintf(msg, args...)))
+func redirectToSheet(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "https://docs.google.com/spreadsheets/d/"+sheetID, http.StatusFound)
 }
 
 type Order struct {
@@ -277,7 +337,7 @@ func decodeMessage(data string) *[]Order {
 
 	// Check if both markers were found
 	if startIndex == -1 || endIndex == -1 || startIndex > endIndex {
-		log.Println("couldn't find relevant portion of email")
+		// log.Println("couldn't find relevant portion of email")
 		// log.Println(bodyStr)
 		// Extract the relevant portion of the email body
 		return nil
@@ -286,7 +346,7 @@ func decodeMessage(data string) *[]Order {
 
 	lines := strings.Split(bodyStr, "\n")
 	if len(lines) < 23 {
-		log.Println("email body doesn't match pattern")
+		// log.Println("email body doesn't match pattern")
 		return nil
 	}
 
@@ -295,15 +355,15 @@ func decodeMessage(data string) *[]Order {
 	// Get the name of the person.
 	nameLine := strings.Split(lines[0], ":")
 	if len(nameLine) < 2 {
-		log.Println("email body doesn't match pattern")
+		// log.Println("email body doesn't match pattern")
 		return nil
 	}
 	name := strings.TrimSpace(nameLine[1])
 
 	// For each product:
-	for i := 14; i < len(lines)-1; i += 7 {
+	for i := 14; i < len(lines)-2; i += 7 {
 		product := strings.TrimSpace(lines[i])
-		if !strings.Contains(product, "Fitness Hub Training Session") {
+		if !strings.Contains(product, productFilter) {
 			continue
 		}
 		// Define the regular expression pattern to match content inside brackets
@@ -311,6 +371,9 @@ func decodeMessage(data string) *[]Order {
 
 		// Find all matches
 		option := re.FindString(product)
+		if option == "" {
+			continue
+		}
 		*orders = append(*orders, Order{Name: name, Time: option})
 	}
 
