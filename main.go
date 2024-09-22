@@ -21,6 +21,7 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
+	"google.golang.org/api/sheets/v4"
 )
 
 const (
@@ -209,17 +210,29 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		return orders[i].Time < orders[j].Time
 	})
 
-	var heading string
-	fmt.Fprintf(w, "Fitness Hub Training Session Bookings\n\tIf the date you want isn't visible, it means that no-one has booked into this session yet")
-	for _, order := range orders {
-		if order.Time != heading {
-			heading = order.Time
-			fmt.Fprintln(w, heading)
-		}
-		fmt.Fprintf(w, "\t%s\n", order.Name)
+	ctx := context.Background()
+	creds, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/spreadsheets.readonly,https://www.googleapis.com/auth/drive.file")
+	if err != nil {
+		log.Println("could not find default credentials:", err)
+		return
 	}
-	w.WriteHeader(200)
-	log.Println("Parsed all messages")
+
+	log.Println(string(creds.JSON))
+
+	sheetsService, err := sheets.NewService(ctx, option.WithCredentials(creds))
+	if err != nil {
+		log.Println("failed to get sheets service:", err)
+		return
+	}
+
+	ss, err := sheetsService.Spreadsheets.Get("1Y4JQ4b2CjZa8TU7ENef6mYTZDkV5hqi9gN_zaJ1T5lM", "A:B").Do()
+	if err != nil {
+		log.Println("failed to get spreadsheet:", err)
+		return
+	}
+
+	ss.Sheets[0].fie
+
 }
 
 func writeError(w http.ResponseWriter, statusCode int, msg string, args ...any) {
