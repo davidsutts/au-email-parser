@@ -3,27 +3,37 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/google/uuid"
 	"github.com/gorilla/sessions"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
+	"google.golang.org/api/people/v1"
+	"google.golang.org/api/sheets/v4"
 )
 
 const (
 	hostAndPort     = "localhost:8080"
 	basketballEmail = "basketball@adelaideunisport.com.au"
+	sheetID         = "12KmIFrkqd2G9Mavxcez8VA6kcZ9O-oKGJzcewQRgLrU"
+	productFilter   = "Fitness Hub"
+	defaultPort     = 8080
 )
 
 var (
@@ -32,28 +42,51 @@ var (
 	projBucket   *storage.BucketHandle
 	sessionStore *sessions.CookieStore
 	service      *gmail.Service
+	client       *http.Client
+	port         int
+	tok          *oauth2.Token
 )
 
 func main() {
 
+	host := "" // determined by GAE
+	v := os.Getenv("PORT")
+	if v != "" {
+		i, err := strconv.Atoi(v)
+		if err == nil {
+			port = i
+		}
+	} else {
+		port = defaultPort
+	}
+
 	mux := http.NewServeMux()
 
-	// mux.HandleFunc("/check/emails/", checkHandler)
-	// mux.HandleFunc("/login/", loginHandler)
-	// mux.HandleFunc("/oauth2redirect/", oauthHandler)
+	mux.HandleFunc("/login/", loginHandler)
+	mux.HandleFunc("/oauth2redirect/", oauthHandler)
 	mux.HandleFunc("/", indexHandler)
 
 	initialise()
 
-	log.Println("✅ Server started on ", hostAndPort)
-	http.ListenAndServe(hostAndPort, mux)
+	log.Printf("✅ Server started on %s:%d", host, port)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf("%s:%d", host, port), mux))
 }
 
 func initialise() {
 
+	gob.Register(&oauth2.Token{})
+
+	var secrets struct {
+		Project struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+		} `json:"web"`
+	}
+
+	sessionStore = sessions.NewCookieStore(sessionKey)
+
 	ctx := context.Background()
 
-	var err error
 	storageClient, err := storage.NewClient(ctx, storage.WithJSONReads())
 	if err != nil {
 		log.Panic("failed to get new storage client:", err)
@@ -61,20 +94,46 @@ func initialise() {
 
 	projBucket = storageClient.Bucket("au-email-parser-tokens")
 
+	// Read secrets
+	reader, err := projBucket.Object("oauth2_secrets.json").NewReader(ctx)
+	if err != nil {
+		log.Fatal("could not get secrets reader:", err)
+	}
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		log.Fatal("unable to read secrets from bucket")
+	}
+
+	err = json.Unmarshal(data, &secrets)
+	if err != nil {
+		log.Fatal("unable to unmarshal secrets:", err)
+	}
+
+	config = &oauth2.Config{
+		RedirectURL:  "http://" + hostAndPort + "/oauth2redirect",
+		ClientID:     secrets.Project.ClientID,
+		ClientSecret: secrets.Project.ClientSecret,
+		Scopes:       []string{"email", "profile"},
+		Endpoint:     google.Endpoint,
+	}
+
+	config.Scopes = append(config.Scopes, gmail.GmailReadonlyScope)
+
 	// Get token from bucket.
 	tokReader, err := projBucket.Object(basketballEmail + "-token.json").NewReader(ctx)
 	if err != nil {
 		log.Panic("unable to get reader for auth token")
 	}
 
-	data, err := io.ReadAll(tokReader)
+	tokData, err := io.ReadAll(tokReader)
 	err = tokReader.Close()
 	if err != nil {
 		log.Panic("unable to read token from bucket:", err)
 	}
 
 	tok := &oauth2.Token{}
-	json.Unmarshal(data, tok)
+	json.Unmarshal(tokData, tok)
 
 	client := oauth2.NewClient(ctx, config.TokenSource(ctx, tok))
 	service, err = gmail.NewService(ctx, option.WithHTTPClient(client))
@@ -83,157 +142,137 @@ func initialise() {
 		return
 	}
 
+	log.Println("✅ Oauth2 Configured")
 	log.Println("✅ Process Initialised")
 }
 
-// func authConfig() {
-// 	gob.Register(&oauth2.Token{})
+func checkHandler(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("OK :)"))
+}
 
-// 	ctx := context.Background()
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	state := uuid.New().String()
 
-// 	if config != nil {
-// 		log.Println("already configured")
-// 		return
-// 	}
+	sess, err := sessionStore.New(r, state)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to create new session: %v", err)
+		return
+	}
 
-// 	if projBucket == nil {
-// 		log.Fatal("bucket is nil")
-// 	}
+	err = sess.Save(r, w)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to save session: %v", err)
+		return
+	}
 
-// 	// Read secrets
-// 	reader, err := projBucket.Object("oauth2_secrets.json").NewReader(ctx)
-// 	if err != nil {
-// 		log.Fatal("could not get secrets reader:", err)
-// 	}
+	url := config.AuthCodeURL(state, oauth2.ApprovalForce, oauth2.AccessTypeOffline)
+	log.Println("redirecting to google oauth2 flow")
+	http.Redirect(w, r, url, http.StatusFound)
+}
 
-// 	data, err := io.ReadAll(reader)
-// 	if err != nil {
-// 		log.Fatal("unable to read secrets from bucket")
-// 	}
+func oauthHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
 
-// 	var secrets struct {
-// 		Project struct {
-// 			ClientID     string `json:"client_id"`
-// 			ClientSecret string `json:"client_secret"`
-// 		} `json:"web"`
-// 	}
+	_, err := sessionStore.Get(r, r.FormValue("state"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "unable to get session with state: %v", err)
+		return
+	}
 
-// 	err = json.Unmarshal(data, &secrets)
-// 	if err != nil {
-// 		log.Fatal("unable to unmarshal secrets:", err)
-// 	}
+	tok, err := config.Exchange(ctx, r.FormValue("code"))
+	if err != nil {
+		log.Println("failed to login:", err)
+		return
+	}
 
-// 	config = &oauth2.Config{
-// 		RedirectURL:  "http://" + hostAndPort + "/oauth2redirect",
-// 		ClientID:     secrets.Project.ClientID,
-// 		ClientSecret: secrets.Project.ClientSecret,
-// 		Scopes:       []string{"email", "profile"},
-// 		Endpoint:     google.Endpoint,
-// 	}
+	// Create a new session with the received token.
+	sess, err := sessionStore.New(r, "au-parser-auth")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create session: %v", err)
+		return
+	}
+	sess.Values["token"] = tok
 
-// 	config.Scopes = append(config.Scopes, gmail.GmailReadonlyScope)
+	client := oauth2.NewClient(ctx, config.TokenSource(ctx, tok))
+	peopleService, err := people.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get peopleService:", err)
+		return
+	}
 
-// 	sessionStore = sessions.NewCookieStore(sessionKey)
+	person, err := peopleService.People.Get("people/me").PersonFields("emailAddresses").Do()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get profile info:", err)
+		return
+	}
 
-// 	log.Println("✅ Oauth2 Configured")
-// }
+	email := person.EmailAddresses[0].Value
 
-// func checkHandler(w http.ResponseWriter, r *http.Request) {
-// 	w.Write([]byte("OK :)"))
-// }
+	// write  secrets
+	writer := projBucket.Object(basketballEmail + "-token.json").NewWriter(ctx)
+	if err != nil {
+		log.Fatal("could not get secrets writer:", err)
+	}
 
-// func loginHandler(w http.ResponseWriter, r *http.Request) {
-// 	state := uuid.New().String()
+	binTok, err := json.Marshal(tok)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to marshal token: %v", err)
+		return
+	}
 
-// 	sess, err := sessionStore.New(r, state)
-// 	if err != nil {
-// 		writeError(w, http.StatusInternalServerError, "unable to create new session: %v", err)
-// 		return
-// 	}
+	_, err = writer.Write(binTok)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to write token to bucket: %v", err)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to write token to bucket: %v", err)
+		return
+	}
 
-// 	err = sess.Save(r, w)
-// 	if err != nil {
-// 		writeError(w, http.StatusInternalServerError, "unable to save session: %v", err)
-// 		return
-// 	}
+	log.Printf("wrote new token to bucket with email: %s", email)
 
-// 	url := config.AuthCodeURL(state, oauth2.ApprovalForce, oauth2.AccessTypeOffline)
-// 	log.Println("redirecting to google oauth2 flow")
-// 	http.Redirect(w, r, url, http.StatusFound)
-// }
+	sess.Values["email"] = email
+	client = oauth2.NewClient(ctx, config.TokenSource(ctx, tok))
+	service, err = gmail.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to override gmail service: %v", err)
+		return
+	}
 
-// func oauthHandler(w http.ResponseWriter, r *http.Request) {
-// 	ctx := context.Background()
+	err = sess.Save(r, w)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "unable to save session: %v", err)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusFound)
+}
 
-// 	_, err := sessionStore.Get(r, r.FormValue("state"))
-// 	if err != nil {
-// 		writeError(w, http.StatusBadRequest, "unable to get session with state: %v", err)
-// 		return
-// 	}
+func verifyProfile(w http.ResponseWriter, r *http.Request) (string, *oauth2.Token) {
+	sess, err := sessionStore.Get(r, "au-parser-auth")
+	if err != nil {
+		log.Printf("user not signed in, redirecting (err fetching session: %v)", err)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return "", nil
+	}
+	tok, ok := sess.Values["token"].(*oauth2.Token)
+	if !ok {
+		log.Println("user not signed in, redirecting (bad token)")
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return "", nil
+	}
 
-// 	tok, err := config.Exchange(ctx, r.FormValue("code"))
-// 	if err != nil {
-// 		log.Println("failed to login:", err)
-// 		return
-// 	}
+	if !tok.Valid() {
+		log.Println("invalid token, redirecting")
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return "", nil
+	}
 
-// 	// Create a new session with the received token.
-// 	sess, err := sessionStore.New(r, "au-parser-auth")
-// 	if err != nil {
-// 		writeError(w, http.StatusInternalServerError, "could not create session: %v", err)
-// 		return
-// 	}
-// 	sess.Values["token"] = tok
-
-// 	client := oauth2.NewClient(ctx, config.TokenSource(ctx, tok))
-// 	peopleService, err := people.NewService(ctx, option.WithHTTPClient(client))
-// 	if err != nil {
-// 		writeError(w, http.StatusInternalServerError, "failed to get peopleService:", err)
-// 		return
-// 	}
-
-// 	person, err := peopleService.People.Get("people/me").PersonFields("emailAddresses").Do()
-// 	if err != nil {
-// 		writeError(w, http.StatusInternalServerError, "failed to get profile info:", err)
-// 		return
-// 	}
-
-// 	email := person.EmailAddresses[0].Value
-
-// 	sess.Values["email"] = email
-// 	err = sess.Save(r, w)
-// 	if err != nil {
-// 		writeError(w, http.StatusInternalServerError, "unable to save session: %v", err)
-// 		return
-// 	}
-// 	http.Redirect(w, r, "/", http.StatusFound)
-// }
-
-// func verifyProfile(w http.ResponseWriter, r *http.Request) (string, *oauth2.Token) {
-// 	sess, err := sessionStore.Get(r, "au-parser-auth")
-// 	if err != nil {
-// 		log.Printf("user not signed in, redirecting (err fetching session: %v)", err)
-// 		http.Redirect(w, r, "/login", http.StatusSeeOther)
-// 		return "", nil
-// 	}
-// 	tok, ok := sess.Values["token"].(*oauth2.Token)
-// 	if !ok {
-// 		log.Println("user not signed in, redirecting (bad token)")
-// 		http.Redirect(w, r, "/login", http.StatusSeeOther)
-// 		return "", nil
-// 	}
-
-// 	if !tok.Valid() {
-// 		log.Println("invalid token, redirecting")
-// 		http.Redirect(w, r, "/login", http.StatusSeeOther)
-// 		return "", nil
-// 	}
-
-// 	return sess.Values["email"].(string), tok
-// }
+	return sess.Values["email"].(string), tok
+}
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
-	// ctx := context.Background()s
 
 	if r.URL.Path != "/" {
 		// Redirect all invalid URLs to the root homepage.
@@ -241,63 +280,82 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// email, tok := verifyProfile(w, r)
-	// if email != basketballEmail && email != "dsutton1202@gmail.com" {
-	// 	fmt.Fprint(w, "This service is only designed for 'basketball@adelaideunisport.com.au'")
-	// 	return
-	// }
-
-	// tokenWriter := projBucket.Object(basketballEmail + "-token.json").NewWriter(ctx)
-	// jsonTok, err := json.Marshal(tok)
-	// if err != nil {
-	// 	writeError(w, http.StatusInternalServerError, "could not marshal token: %v", err)
-	// 	return
-	// }
-	// n, err := tokenWriter.Write(jsonTok)
-	// err = tokenWriter.Close()
-	// if err != nil {
-	// 	writeError(w, http.StatusInternalServerError, "unable to write token to bucket: %v", err)
-	// 	return
-	// }
-	// log.Printf("wrote %d bytes", n)
-
-	// client := oauth2.NewClient(ctx, config.TokenSource(ctx, tok))
-	// service, err := gmail.NewService(ctx, option.WithHTTPClient(client))
-	// if err != nil {
-	// 	log.Println("unable to create new service:", err)
-	// 	return
-	// }
-
-	list, err := service.Users.Messages.List(basketballEmail).LabelIds("Label_7006746477333341141").Do()
+	list, err := service.Users.Messages.List(basketballEmail).Q(productFilter).LabelIds("Label_7006746477333341141").Do()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "unable to get emails with given label:", err)
+		log.Printf("unable to get emails with given label: %v", err)
+		redirectToSheet(w, r)
 		return
 	}
 
 	if len(list.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "unable to find any matching emails")
+		log.Printf("unable to find any matching emails")
+		redirectToSheet(w, r)
 		return
 	}
 	length := len(list.Messages)
-	log.Printf("got %d emails", length)
+
+	ctx := context.Background()
+	creds, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/drive.file")
+	if err != nil {
+		log.Println("could not find default credentials:", err)
+		redirectToSheet(w, r)
+		return
+	}
+
+	sheetsService, err := sheets.NewService(ctx, option.WithCredentials(creds))
+	if err != nil {
+		log.Println("failed to get sheets service:", err)
+		redirectToSheet(w, r)
+		return
+	}
+
+	values, err := sheetsService.Spreadsheets.Values.Get("12KmIFrkqd2G9Mavxcez8VA6kcZ9O-oKGJzcewQRgLrU", "ID!A:A").Do()
+	if err != nil {
+		log.Println("failed to get spreadsheet values:", err)
+		redirectToSheet(w, r)
+		return
+	}
+	readIDs := make(map[string]bool)
+	if len(values.Values) >= 0 {
+		for _, v := range values.Values {
+			readIDs[v[0].(string)] = true
+		}
+	}
+
+	newEmailsLen := length - len(values.Values)
+	log.Printf("got %d emails, parsing %d new emails", length, newEmailsLen)
+
+	if newEmailsLen == 0 {
+		redirectToSheet(w, r)
+		return
+	}
 
 	var wg sync.WaitGroup
 	ch := make(chan Order, length)
-	wg.Add(length)
+	ids := &sheets.ValueRange{
+		Values: [][]interface{}{},
+	}
 	for _, message := range list.Messages {
 		time.Sleep(10 * time.Millisecond)
+
+		if readIDs[message.Id] {
+			continue
+		} else {
+			ids.Values = append(ids.Values, []interface{}{message.Id})
+		}
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+
 			// Retrieve the full message to access its payload and headers
 			fullMessage, err := service.Users.Messages.Get(basketballEmail, message.Id).Do()
 			if err != nil {
 				log.Println("unable to retrieve full message:", err)
-				wg.Done()
 				return
 			}
 
 			if fullMessage.Payload == nil || len(fullMessage.Payload.Headers) == 0 {
 				log.Println("message has no payload or headers")
-				wg.Done()
 				return
 			}
 
@@ -305,7 +363,6 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 			orders := getBodyFromPayload(fullMessage.Payload)
 
 			if orders == nil {
-				wg.Done()
 				return
 			}
 
@@ -313,7 +370,6 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 			for _, order := range *orders {
 				ch <- order
 			}
-			wg.Done()
 		}()
 	}
 	go func() {
@@ -327,20 +383,39 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
+	_, err = sheetsService.Spreadsheets.Values.Append(sheetID, "ID!A:A", ids).ValueInputOption("RAW").Do()
+	if err != nil {
+		log.Println("failed to append spreadsheet values:", err)
+		redirectToSheet(w, r)
+		return
+	}
+
 	sort.Slice(orders, func(i, j int) bool {
 		return orders[i].Time < orders[j].Time
 	})
 
-	var heading string
-	for _, order := range orders {
-		if order.Time != heading {
-			heading = order.Time
-			fmt.Fprintln(w, heading)
-		}
-		fmt.Fprintf(w, "\t%s\n", order.Name)
+	ordersToWrite := &sheets.ValueRange{
+		Values: [][]interface{}{},
 	}
-	log.Println("Parsed all messages")
+	for _, order := range orders {
+		ordersToWrite.Values = append(ordersToWrite.Values, []interface{}{order.Time, order.Name})
+	}
 
+	_, err = sheetsService.Spreadsheets.Values.Append(sheetID, "Sessions!A:B", ordersToWrite).
+		ValueInputOption("RAW").
+		Do()
+	if err != nil {
+		log.Println("failed to append spreadsheet values:", err)
+		redirectToSheet(w, r)
+		return
+	}
+
+	redirectToSheet(w, r)
+
+}
+
+func redirectToSheet(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "https://docs.google.com/spreadsheets/d/"+sheetID, http.StatusFound)
 }
 
 func writeError(w http.ResponseWriter, statusCode int, msg string, args ...any) {
@@ -424,7 +499,7 @@ func decodeMessage(data string) *[]Order {
 	// For each product:
 	for i := 14; i < len(lines)-1; i += 7 {
 		product := strings.TrimSpace(lines[i])
-		if !strings.Contains(product, "Winter Dinner") {
+		if !strings.Contains(product, "Fitness Hub Training Session") {
 			continue
 		}
 		// Define the regular expression pattern to match content inside brackets
@@ -432,12 +507,18 @@ func decodeMessage(data string) *[]Order {
 
 		// Find all matches
 		option := re.FindString(product)
+
+		// Trim Brackets.
+		option = strings.Trim(option, "()")
+
 		*orders = append(*orders, Order{Name: name, Time: option})
 	}
 
 	if len(*orders) == 0 {
 		return nil
 	}
+
+	log.Println(orders)
 
 	return orders
 
